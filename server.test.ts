@@ -18,7 +18,7 @@ function localDay(ts: number): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
-// Same markers host-json-collector.ts's hostJsonCollector() wraps its
+// Same markers host-json-collector-runtime.ts's hostJsonCollector() wraps its
 // gzipped result in; not exported (they're a private wire format between
 // the generated host script and extractHostJsonScan), so the fixture
 // reproduces them rather than importing.
@@ -128,11 +128,11 @@ describe("sync RPC", () => {
       const outer = command.match(/Buffer\.from\("([A-Za-z0-9+/=]+)"/);
       if (!outer) return null;
       const source = gunzipSync(Buffer.from(outer[1]!, "base64")).toString("utf8");
-      // Inner layer: the collector function is invoked as
-      // (function hostJsonCollector(encodedInput, dependencies) {...})("<base64 JSON>", {...}) —
+      // Inner layer: the generated collector bundle is invoked as
+      // __bbUsageHostCollector.hostJsonCollector("<base64 JSON>", {...}) —
       // encodedInput is JSON.stringify(input) base64'd separately from the
       // gzip layer above.
-      const inner = source.match(/\}\)\("([A-Za-z0-9+/=]+)"/);
+      const inner = source.match(/\.hostJsonCollector\("([A-Za-z0-9+/=]+)"/);
       if (!inner) return null;
       const input = JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8")) as { agentId?: string };
       return input.agentId ?? null;
