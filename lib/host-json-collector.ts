@@ -215,11 +215,16 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     prior.cacheWriteTokens = Math.max(prior.cacheWriteTokens, raw.cacheWriteTokens);
     prior.outputTokens = Math.max(prior.outputTokens, raw.outputTokens);
     if (raw.loggedCostUsd !== null) prior.loggedCostUsd = Math.max(prior.loggedCostUsd ?? 0, raw.loggedCostUsd);
+    // Copies are re-stamped at write time, so the earliest copy is the original
+    // and carries the call's day and project.
+    if (raw.day < prior.day) {
+      prior.day = raw.day;
+      prior.project = raw.project;
+      if (!raw.model.endsWith("-unknown")) prior.model = raw.model;
+    }
     // A Codex call copy can land in a file whose turn_context has not named the
     // model yet. Prefer the real model: an unknown model has no catalog price.
     if (prior.model.endsWith("-unknown") && !raw.model.endsWith("-unknown")) prior.model = raw.model;
-    // Copies are re-stamped at write time, so the earliest day is the call's day.
-    if (raw.day < prior.day) prior.day = raw.day;
   }
 
   function matches(filePath: string) {
@@ -397,6 +402,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         // identifies a call. The usage tuple plus the session's running totals
         // does: the totals strictly increase, so two calls cannot share them.
         // The model comes from file-level state, so it stays out of the identity.
+        // Residual risk: a session's first call has totals equal to the call, so
+        // two sessions with byte-identical first calls would count once.
         const totals = object(object(payload.info)?.total_token_usage);
         const runningTotal = finite(totals?.total_tokens);
         const runningInput = finite(totals?.input_tokens);

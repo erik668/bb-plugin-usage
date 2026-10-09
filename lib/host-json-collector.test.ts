@@ -259,6 +259,25 @@ describe("host JSON usage collector", () => {
     expect(second.rows).toEqual(expected);
   });
 
+  it("counts a Codex call repeated within one rollout once and sums records without totals", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "sessions");
+    await mkdir(root, { recursive: true });
+    const bare = { type: "token_count", info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 60, output_tokens: 20 } } };
+    await writeFile(join(root, "rollout-mixed.jsonl"), [
+      { timestamp: "2026-08-09T12:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+      { timestamp: "2026-08-09T12:00:01Z", type: "event_msg", payload: codexCall(5_000) },
+      { timestamp: "2026-08-09T12:00:02Z", type: "event_msg", payload: codexCall(5_000) },
+      { timestamp: "2026-08-09T12:00:03Z", type: "event_msg", payload: bare },
+      { timestamp: "2026-08-09T12:00:04Z", type: "event_msg", payload: bare },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+    const result = await scan("codex", root, join(directory, "cache.json"));
+    // One deduplicated call (40 uncached, 60 cached) plus two summed bare records.
+    expect(result.rows).toEqual([expect.objectContaining({
+      model: "gpt-5.6-sol", uncachedInputTokens: 120, cachedInputTokens: 180, outputTokens: 60,
+    })]);
+  });
+
   it("keeps identical Codex calls in separate accounts apart", async () => {
     const directory = await temporaryDirectory();
     const root = join(directory, ".codex", "sessions");
