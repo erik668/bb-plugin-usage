@@ -86,10 +86,12 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   // v6 (copilot): add session summaries.
   // v7 (copilot): uncached input subtracts cache reads and writes; rows cached
   // under v6 keep the double-counted values and must be reparsed.
+  // v7 (codex): identify each call by its running totals so copies that Codex
+  // re-materializes into other sessions are counted once.
   // Other agents retain their existing versions; adding Copilot must not
   // force users without Copilot to reparse unrelated session logs.
-  const cacheVersion = input.agentId === "copilot" ? 7
-    : input.agentId === "dsh" || input.agentId === "codex" ? 6 : 5;
+  const cacheVersion = input.agentId === "copilot" || input.agentId === "codex" ? 7
+    : input.agentId === "dsh" ? 6 : 5;
   const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "copilot", "freebuff", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
@@ -213,6 +215,11 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     prior.cacheWriteTokens = Math.max(prior.cacheWriteTokens, raw.cacheWriteTokens);
     prior.outputTokens = Math.max(prior.outputTokens, raw.outputTokens);
     if (raw.loggedCostUsd !== null) prior.loggedCostUsd = Math.max(prior.loggedCostUsd ?? 0, raw.loggedCostUsd);
+    // A Codex call copy can land in a file whose turn_context has not named the
+    // model yet. Prefer the real model: an unknown model has no catalog price.
+    if (prior.model.endsWith("-unknown") && !raw.model.endsWith("-unknown")) prior.model = raw.model;
+    // Copies are re-stamped at write time, so the earliest day is the call's day.
+    if (raw.day < prior.day) prior.day = raw.day;
   }
 
   function matches(filePath: string) {
@@ -379,12 +386,31 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         if (!usage || !usageDay) continue;
         const inputTokens = count(usage.input_tokens);
         const cached = Math.min(inputTokens, count(usage.cached_input_tokens));
-        add(rows, {
+        const row: CachedUsageRow = {
           day: usageDay, modelProviderId: "openai", model: codexModel, project: sessionProject, loggedCostUsd: null,
           account: fileAccount,
           uncachedInputTokens: inputTokens - cached, cachedInputTokens: cached,
           cacheWriteTokens: count(usage.cache_write_input_tokens), outputTokens: count(usage.output_tokens),
-        });
+        };
+        // Codex re-materializes token_count records into other sessions' rollout
+        // files, re-stamped with the write time, so neither session id nor day
+        // identifies a call. The usage tuple plus the session's running totals
+        // does: the totals strictly increase, so two calls cannot share them.
+        // The model comes from file-level state, so it stays out of the identity.
+        const totals = object(object(payload.info)?.total_token_usage);
+        const runningTotal = finite(totals?.total_tokens);
+        const runningInput = finite(totals?.input_tokens);
+        if (runningTotal !== null && runningInput !== null) {
+          row.eventKey = crypto.createHash("sha256").update(JSON.stringify([
+            "codex", fileAccount ?? null, inputTokens, count(usage.cached_input_tokens), count(usage.output_tokens),
+            count(usage.reasoning_output_tokens), runningTotal, runningInput,
+          ])).digest("hex");
+          mergeEvent(events, row);
+        } else {
+          // Without running totals the tuple cannot tell calls apart; fall back
+          // to the session bucket identity below.
+          add(rows, row);
+        }
         continue;
       }
 
@@ -647,12 +673,12 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       if (row.uncachedInputTokens + row.cachedInputTokens + row.cacheWriteTokens + row.outputTokens > 0) add(rows, row);
     }
     if (input.agentId === "codex") {
-      return [...rows.values()].map((row) => ({
+      return [...events.values(), ...[...rows.values()].map((row) => ({
         ...row,
         eventKey: crypto.createHash("sha256").update(JSON.stringify([
           "codex", codexSessionId, row.account ?? null, row.day, row.modelProviderId, row.model, row.project,
         ])).digest("hex"),
-      }));
+      }))];
     }
     return input.agentId === "claude" || input.agentId === "copilot"
       ? [...events.values(), ...rows.values()]

@@ -55,7 +55,7 @@ afterEach(async () => {
 
 describe("host JSON usage collector", () => {
   it.each([
-    ["codex", "rollout-cached.jsonl", 6], ["claude", "session.jsonl", 5],
+    ["codex", "rollout-cached.jsonl", 7], ["claude", "session.jsonl", 5],
     ["dsh", "session.v3.jsonl.zstd", 6], ["fx", "usage.jsonl", 5],
     ["grok", "unified.jsonl", 5], ["pi", "session.jsonl", 5],
     ["prime", "session.jsonl", 5], ["antigravity", "usage.jsonl", 5],
@@ -217,6 +217,63 @@ describe("host JSON usage collector", () => {
     await copyFile(active, join(roots[1]!, "rollout-legacy.jsonl"));
     const result = await scan("codex", roots, join(directory, "cache.json"));
     expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 100, outputTokens: 5 })]);
+  });
+
+  // One API call: `last_token_usage` is the call and `total_token_usage` the
+  // session's running total, which pins the call to a position in its history.
+  function codexCall(running: number) {
+    return { type: "token_count", info: {
+      last_token_usage: { input_tokens: 100, cached_input_tokens: 60, cache_write_input_tokens: 5, output_tokens: 20, reasoning_output_tokens: 7 },
+      total_token_usage: { total_tokens: running, input_tokens: running - 20 },
+    } };
+  }
+
+  it("counts a Codex call once when it is re-materialized into another session's rollout", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "sessions");
+    await mkdir(root, { recursive: true });
+    await writeFile(join(root, "rollout-origin.jsonl"), [
+      { timestamp: "2026-08-09T12:00:00Z", type: "session_meta", payload: { id: "session-1" } },
+      { timestamp: "2026-08-09T12:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+      { timestamp: "2026-08-09T12:00:01Z", type: "event_msg", payload: codexCall(5_000) },
+      // A distinct call with the same usage tuple and a later running total.
+      { timestamp: "2026-08-09T12:00:02Z", type: "event_msg", payload: codexCall(9_000) },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+    // The copy lives in another session, is re-stamped a day later, and never
+    // names a model, so it parses as "codex-unknown".
+    await writeFile(join(root, "rollout-copy.jsonl"), [
+      { timestamp: "2026-08-11T09:00:00Z", type: "session_meta", payload: { id: "session-2" } },
+      { timestamp: "2026-08-11T09:00:01Z", type: "event_msg", payload: codexCall(5_000) },
+      { timestamp: "2026-08-11T09:00:02Z", type: "event_msg", payload: codexCall(9_000) },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+    const cachePath = join(directory, "cache.json");
+    const expected = [expect.objectContaining({
+      day: localDay("2026-08-09T12:00:01Z"), modelProviderId: "openai", model: "gpt-5.6-sol",
+      uncachedInputTokens: 80, cachedInputTokens: 120, cacheWriteTokens: 10, outputTokens: 40,
+    })];
+    const first = await scan("codex", root, cachePath);
+    expect(first).toMatchObject({ fileCount: 2, failureCount: 0 });
+    expect(first.rows).toEqual(expected);
+    const second = await scan("codex", root, cachePath);
+    expect(second.reusedFileCount).toBe(2);
+    expect(second.rows).toEqual(expected);
+  });
+
+  it("keeps identical Codex calls in separate accounts apart", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, ".codex", "sessions");
+    const accountRoot = join(directory, ".codex-profiles");
+    const rollout = [
+      { timestamp: "2026-08-09T12:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+      { timestamp: "2026-08-09T12:00:01Z", type: "event_msg", payload: codexCall(5_000) },
+    ].map((value) => JSON.stringify(value)).join("\n");
+    await mkdir(root, { recursive: true });
+    await mkdir(join(accountRoot, "work", "sessions"), { recursive: true });
+    await writeFile(join(root, "rollout-a.jsonl"), rollout);
+    await writeFile(join(accountRoot, "work", "sessions", "rollout-a.jsonl"), rollout);
+    const result = await scan("codex", root, join(directory, "cache.json"), { accountRoot });
+    expect(result.rows).toHaveLength(2);
+    expect(result.rows.map((row) => row.account ?? null)).toEqual(expect.arrayContaining([null, "work"]));
   });
 
   it("does not double-count moved Codex usage when a failed root retains the old cache entry", async () => {
@@ -705,7 +762,7 @@ describe("host JSON usage collector", () => {
     const result = await scan("codex", root, cachePath);
     expect(result.reusedFileCount).toBe(0);
     expect(result.rows.map((row) => row.day)).not.toContain("1999-01-01");
-    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(6);
+    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(7);
   });
 
   it("decodes concatenated dsh session frames and aggregates settlement usage", async () => {
